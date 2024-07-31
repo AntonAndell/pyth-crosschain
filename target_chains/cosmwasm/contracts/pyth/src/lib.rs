@@ -2,7 +2,7 @@
 extern crate lazy_static;
 
 pub mod contract;
-pub mod governance;
+pub mod error;
 pub mod msg;
 pub mod state;
 

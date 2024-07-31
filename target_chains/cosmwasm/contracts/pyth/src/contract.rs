@@ -1,83 +1,41 @@
 #[cfg(feature = "injective")]
-use crate::injective::{
-    create_relay_pyth_prices_msg,
-    InjectiveMsgWrapper as MsgWrapper,
-};
+use crate::injective::{create_relay_pyth_prices_msg, InjectiveMsgWrapper as MsgWrapper};
 #[cfg(not(feature = "injective"))]
 use cosmwasm_std::Empty as MsgWrapper;
 #[cfg(feature = "osmosis")]
 use osmosis_std::types::osmosis::txfees::v1beta1::TxfeesQuerier;
 use {
     crate::{
-        governance::{
-            GovernanceAction::{
-                AuthorizeGovernanceDataSourceTransfer,
-                RequestGovernanceDataSourceTransfer,
-                SetDataSources,
-                SetFee,
-                SetValidPeriod,
-                UpgradeContract,
-            },
-            GovernanceInstruction,
-            GovernanceModule,
-        },
-        msg::{
-            InstantiateMsg,
-            MigrateMsg,
-        },
+        error::ContractError,
+        msg::{InstantiateMsg, MigrateMsg},
         state::{
-            config,
-            config_read,
-            price_feed_bucket,
-            price_feed_read_bucket,
-            set_contract_version,
-            ConfigInfo,
-            PythDataSource,
+            config, config_read, price_feed_bucket, price_feed_read_bucket, set_contract_version,
+            ConfigInfo, GuardianAddress, GuardianSetInfo, PythDataSource,
         },
     },
     byteorder::BigEndian,
     cosmwasm_std::{
-        coin,
-        entry_point,
-        to_binary,
-        Addr,
-        Binary,
-        Coin,
-        CosmosMsg,
-        Deps,
-        DepsMut,
-        Env,
-        MessageInfo,
-        OverflowError,
-        OverflowOperation,
-        QueryRequest,
-        Response,
-        StdResult,
-        WasmMsg,
+        coin, entry_point, to_binary, Addr, Binary, Coin, CosmosMsg, Deps, DepsMut, Env,
+        MessageInfo, OverflowError, OverflowOperation, QueryRequest, Response, StdResult, WasmMsg,
         WasmQuery,
     },
-    cw_wormhole::{
-        msg::QueryMsg as WormholeQueryMsg,
-        state::ParsedVAA,
+    cw_wormhole::byte_utils::ByteUtils,
+    cw_wormhole::{msg::QueryMsg as WormholeQueryMsg, state::ParsedVAA},
+    generic_array::GenericArray,
+    k256::{
+        ecdsa::{
+            recoverable::{Id as RecoverableId, Signature as RecoverableSignature},
+            Signature, VerifyingKey,
+        },
+        elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint},
+        AffinePoint, EncodedPoint,
     },
-    pyth_sdk::{
-        Identifier,
-        UnixTimestamp,
-    },
+    pyth_sdk::{Identifier, UnixTimestamp},
     pyth_sdk_cw::{
-        error::PythContractError,
-        ExecuteMsg,
-        Price,
-        PriceFeed,
-        PriceFeedResponse,
-        PriceIdentifier,
+        error::PythContractError, ExecuteMsg, Price, PriceFeed, PriceFeedResponse, PriceIdentifier,
         QueryMsg,
     },
-    pyth_wormhole_attester_sdk::{
-        BatchPriceAttestation,
-        PriceAttestation,
-        PriceStatus,
-    },
+    pyth_wormhole_attester_sdk::{BatchPriceAttestation, PriceAttestation, PriceStatus},
     pythnet_sdk::{
         accumulators::merkle::MerkleRoot,
         hashers::keccak256_160::Keccak160,
@@ -85,20 +43,13 @@ use {
         wire::{
             from_slice,
             v1::{
-                AccumulatorUpdateData,
-                Proof,
-                WormholeMessage,
-                WormholePayload,
+                AccumulatorUpdateData, Proof, WormholeMessage, WormholePayload,
                 PYTHNET_ACCUMULATOR_UPDATE_MAGIC,
             },
         },
     },
-    std::{
-        collections::HashSet,
-        convert::TryFrom,
-        iter::FromIterator,
-        time::Duration,
-    },
+    sha3::{Digest, Keccak256},
+    std::{collections::HashSet, convert::TryFrom, iter::FromIterator, time::Duration},
 };
 
 const CONTRACT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -129,14 +80,14 @@ pub fn instantiate(
 ) -> StdResult<Response> {
     // Save general wormhole and pyth info
     let state = ConfigInfo {
-        wormhole_contract:          deps.api.addr_validate(msg.wormhole_contract.as_ref())?,
-        data_sources:               msg.data_sources.iter().cloned().collect(),
-        chain_id:                   msg.chain_id,
-        governance_source:          msg.governance_source.clone(),
-        governance_source_index:    msg.governance_source_index,
+        wormhole_contract: deps.api.addr_validate(msg.wormhole_contract.as_ref())?,
+        data_sources: msg.data_sources.iter().cloned().collect(),
+        chain_id: msg.chain_id,
+        governance_source: msg.governance_source.clone(),
+        governance_source_index: msg.governance_source_index,
         governance_sequence_number: msg.governance_sequence_number,
-        valid_time_period:          Duration::from_secs(msg.valid_time_period_secs as u64),
-        fee:                        msg.fee,
+        valid_time_period: Duration::from_secs(msg.valid_time_period_secs as u64),
+        fee: msg.fee,
     };
     config(deps.storage).save(&state)?;
 
@@ -145,21 +96,140 @@ pub fn instantiate(
     Ok(Response::default())
 }
 
-/// Verify that `data` represents an authentic Wormhole VAA.
-///
-/// *Warning* this function does not verify the emitter of the wormhole message; it only checks
-/// that the wormhole signatures are valid. The caller is responsible for checking that the message
-/// originates from the expected emitter.
-pub fn parse_and_verify_vaa(deps: Deps, block_time: u64, data: &Binary) -> StdResult<ParsedVAA> {
-    let cfg = config_read(deps.storage).load()?;
-    let vaa: ParsedVAA = deps.querier.query(&QueryRequest::Wasm(WasmQuery::Smart {
-        contract_addr: cfg.wormhole_contract.to_string(),
-        msg:           to_binary(&WormholeQueryMsg::VerifyVAA {
-            vaa: data.clone(),
-            block_time,
-        })?,
-    }))?;
+/// Parses raw VAA data into a struct and verifies whether it contains sufficient signatures of an
+/// active guardian set i.e. is valid according to Wormhole consensus rules
+fn parse_and_verify_vaa(block_time: u64, data: &[u8]) -> StdResult<ParsedVAA> {
+    let vaa = ParsedVAA::deserialize(data)?;
+
+    if vaa.version != 1 {
+        return Err(PythContractError::InvalidMerkleProof)?;
+    }
+
+    // // Check if VAA with this hash was already accepted
+    // if vaa_archive_check(storage, vaa.hash.as_slice()) {
+    //     return Err(PythContractError::InvalidMerkleProof)?;
+    // }
+
+    // Load and check guardian set
+    // let guardian_set = guardian_set_get(storage, vaa.guardian_set_index);
+    // let guardian_set: GuardianSetInfo = guardian_set.unwrap();
+    println!(" {:?}", vaa.guardian_set_index);
+    let hex_strings = vec![
+        "0x5893B5A76c3f739645648885bDCcC06cd70a3Cd3",
+        "0xfF6CB952589BDE862c25Ef4392132fb9D4A42157",
+        "0x114De8460193bdf3A2fCf81f86a09765F4762fD1",
+        "0x107A0086b32d7A0977926A205131d8731D39cbEB",
+        "0x8C82B2fd82FaeD2711d59AF0F2499D16e726f6b2",
+        "0x11b39756C042441BE6D8650b69b54EbE715E2343",
+        "0x54Ce5B4D348fb74B958e8966e2ec3dBd4958a7cd",
+        "0x15e7cAF07C4e3DC8e7C469f92C8Cd88FB8005a20",
+        "0x74a3bf913953D695260D88BC1aA25A4eeE363ef0",
+        "0x000aC0076727b35FBea2dAc28fEE5cCB0fEA768e",
+        "0xAF45Ced136b9D9e24903464AE889F5C8a723FC14",
+        "0xf93124b7c738843CBB89E864c862c38cddCccF95",
+        "0xD2CC37A4dc036a8D232b48f62cDD4731412f4890",
+        "0xDA798F6896A3331F64b48c12D1D57Fd9cbe70811",
+        "0x71AA1BE1D36CaFE3867910F99C09e347899C19C3",
+        "0x8192b6E7387CCd768277c17DAb1b7a5027c0b3Cf",
+        "0x178e21ad2E77AE06711549CFBB1f9c7a9d8096e8",
+        "0x5E1487F35515d02A92753504a8D75471b9f49EdB",
+        "0x6FbEBc898F403E4773E95feB15E80C9A99c8348d",
+    ];
+    let vec_of_binary: Vec<Binary> = hex_strings
+        .iter()
+        .map(|s| &s[2..]) // Remove the "0x" prefix
+        .map(hex::decode) // Decode the hex string into a Vec<u8>
+        .map(|result| result.map(Binary::from)) // Wrap the result in Binary
+        .collect::<Result<_, _>>()
+        .or_else(|_| ContractError::CannotDecodeSignature.std_err())?;
+
+    let mut addresses = Vec::with_capacity(vec_of_binary.len());
+    for i in 0..vec_of_binary.len() {
+        addresses.push(GuardianAddress {
+            bytes: vec_of_binary.get(i).unwrap().clone(),
+        });
+    }
+    let guardian_set = GuardianSetInfo {
+        addresses,
+        expiration_time: 0,
+    };
+    // if guardian_set.expiration_time != 0 && guardian_set.expiration_time < block_time {
+    //     return Err(PythContractError::InvalidMerkleProof)?;
+    // }
+    // if (vaa.len_signers as usize) < guardian_set.quorum() {
+    //     return Err(PythContractError::InvalidMerkleProof)?;
+    // }
+
+    // Verify guardian signatures
+    let mut last_index: i32 = -1;
+    let mut pos = ParsedVAA::HEADER_LEN;
+
+    for _ in 0..vaa.len_signers {
+        if pos + ParsedVAA::SIGNATURE_LEN > data.len() {
+            return Err(PythContractError::InvalidMerkleProof)?;
+        }
+        let index = data.get_u8(pos) as i32;
+        if index <= last_index {
+            return Err(PythContractError::InvalidMerkleProof)?;
+        }
+        last_index = index;
+        let signature = Signature::try_from(
+            &data[pos + ParsedVAA::SIG_DATA_POS
+                ..pos + ParsedVAA::SIG_DATA_POS + ParsedVAA::SIG_DATA_LEN],
+        )
+        .or_else(|_| ContractError::CannotDecodeSignature.std_err())?;
+        let id = RecoverableId::new(data.get_u8(pos + ParsedVAA::SIG_RECOVERY_POS))
+            .or_else(|_| ContractError::CannotDecodeSignature.std_err())?;
+        let recoverable_signature = RecoverableSignature::new(&signature, id)
+            .or_else(|_| ContractError::CannotDecodeSignature.std_err())?;
+
+        let verify_key: VerifyingKey = recoverable_signature
+            .recover_verifying_key_from_digest_bytes(GenericArray::from_slice(vaa.hash.as_slice()))
+            .or_else(|_| ContractError::CannotRecoverKey.std_err())?;
+
+        let index = index as usize;
+        println!(" {:?}", index);
+
+        if index >= guardian_set.addresses.len() {
+            return ContractError::TooManySignatures.std_err();
+        }
+
+        if !keys_equal(&verify_key, &guardian_set.addresses[index]) {
+            return ContractError::GuardianSignatureError.std_err();
+        }
+        pos += ParsedVAA::SIGNATURE_LEN;
+    }
+
     Ok(vaa)
+}
+
+fn keys_equal(a: &VerifyingKey, b: &GuardianAddress) -> bool {
+    let mut hasher = Keccak256::new();
+
+    let affine_point_option = AffinePoint::from_encoded_point(&EncodedPoint::from(a));
+    let affine_point = if affine_point_option.is_some().into() {
+        affine_point_option.unwrap()
+    } else {
+        return false;
+    };
+
+    let decompressed_point = affine_point.to_encoded_point(false);
+
+    hasher.update(&decompressed_point.as_bytes()[1..]);
+    let a = &hasher.finalize()[12..];
+
+    let b = &b.bytes;
+    println!(" {:?}", hex::encode(a));
+
+    if a.len() != b.len() {
+        return false;
+    }
+    for (ai, bi) in a.iter().zip(b.as_slice().iter()) {
+        if ai != bi {
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg_attr(not(feature = "library"), entry_point)]
@@ -171,82 +241,7 @@ pub fn execute(
 ) -> StdResult<Response<MsgWrapper>> {
     match msg {
         ExecuteMsg::UpdatePriceFeeds { data } => update_price_feeds(deps, env, info, &data),
-        ExecuteMsg::ExecuteGovernanceInstruction { data } => {
-            execute_governance_instruction(deps, env, info, &data)
-        }
     }
-}
-
-#[cfg(not(feature = "osmosis"))]
-fn is_fee_sufficient(deps: &Deps, info: MessageInfo, data: &[Binary]) -> StdResult<bool> {
-    use cosmwasm_std::has_coins;
-
-    let state = config_read(deps.storage).load()?;
-
-    // For any chain other than osmosis there is only one base denom
-    // If base denom is present in coins and has enough amount this will return true
-    // or if the base fee is set to 0
-    // else it will return false
-    return Ok(state.fee.amount.u128() == 0
-        || has_coins(info.funds.as_ref(), &get_update_fee(deps, data)?));
-}
-
-// it only checks for fee denoms other than the base denom
-#[cfg(feature = "osmosis")]
-fn is_allowed_tx_fees_denom(deps: &Deps, denom: &String) -> bool {
-    // TxFeesQuerier uses stargate queries which we can't mock as of now.
-    // The capability has not been implemented in `cosmwasm-std` yet.
-    // Hence, we are hacking it with a feature flag to be able to write tests.
-    // FIXME
-    #[cfg(test)]
-    if denom == "uion"
-        || denom == "ibc/FF3065989E34457F342D4EFB8692406D49D4E2B5C70F725F127862E22CE6BDCD"
-    {
-        return true;
-    }
-
-    let querier = TxfeesQuerier::new(&deps.querier);
-    match querier.denom_pool_id(denom.to_string()) {
-        Ok(_) => true,
-        Err(_) => false,
-    }
-}
-
-// TODO: add tests for these
-#[cfg(feature = "osmosis")]
-fn is_fee_sufficient(deps: &Deps, info: MessageInfo, data: &[Binary]) -> StdResult<bool> {
-    let state = config_read(deps.storage).load()?;
-
-    // how to change this in future
-    // for given coins verify they are allowed in txfee module
-    // convert each of them to the base token that is 'uosmo'
-    // combine all the converted token
-    // check with `has_coins`
-
-    // FIXME: should we accept fee for a single transaction in different tokens?
-    let mut total_amount = 0u128;
-    for coin in &info.funds {
-        if coin.denom != state.fee.denom && !is_allowed_tx_fees_denom(deps, &coin.denom) {
-            return Err(PythContractError::InvalidFeeDenom {
-                denom: coin.denom.to_string(),
-            })?;
-        }
-        total_amount = total_amount
-            .checked_add(coin.amount.u128())
-            .ok_or(OverflowError::new(
-                OverflowOperation::Add,
-                total_amount,
-                coin.amount,
-            ))?;
-    }
-
-    let base_denom_fee = get_update_fee(deps, data)?;
-
-    // NOTE: the base fee denom right now is = denom: 'uosmo', amount: 1, which is almost negligible
-    // It's not important to convert the price right now. For now
-    // we are keeping the base fee amount same for each valid denom -> 1
-    // but this logic will be updated to use spot price for different valid tokens in future
-    Ok(base_denom_fee.amount.u128() <= total_amount)
 }
 
 /// Update the on-chain price feeds given the array of price update VAAs `data`.
@@ -260,10 +255,6 @@ fn update_price_feeds(
     info: MessageInfo,
     data: &[Binary],
 ) -> StdResult<Response<MsgWrapper>> {
-    if !is_fee_sufficient(&deps.as_ref(), info, data)? {
-        return Err(PythContractError::InsufficientFee)?;
-    }
-
     let (num_total_attestations, total_new_feeds) = apply_updates(&mut deps, &env, data)?;
 
     let num_total_new_attestations = total_new_feeds.len();
@@ -289,192 +280,14 @@ fn update_price_feeds(
     }
 }
 
-/// Execute a governance instruction provided as the VAA `data`.
-/// The VAA must come from an authorized governance emitter.
-/// See [GovernanceInstruction] for descriptions of the supported operations.
-fn execute_governance_instruction(
-    deps: DepsMut,
-    env: Env,
-    _info: MessageInfo,
-    data: &Binary,
-) -> StdResult<Response<MsgWrapper>> {
-    let vaa = parse_and_verify_vaa(deps.as_ref(), env.block.time.seconds(), data)?;
-    let state = config_read(deps.storage).load()?;
-    verify_vaa_from_governance_source(&state, &vaa)?;
-
-    // store updates to the config as a result of this action in here.
-    let mut updated_config: ConfigInfo = state.clone();
-
-    // Governance messages must be applied in order. This check prevents replay attacks where
-    // previous messages are re-applied.
-    if vaa.sequence <= state.governance_sequence_number {
-        return Err(PythContractError::OldGovernanceMessage)?;
-    } else {
-        updated_config.governance_sequence_number = vaa.sequence;
-    }
-
-    let data = &vaa.payload;
-    let instruction = GovernanceInstruction::deserialize(&data[..])
-        .map_err(|_| PythContractError::InvalidGovernancePayload)?;
-
-    // Check that the instruction is intended for this chain.
-    // chain_id = 0 means the instruction applies to all chains
-    if instruction.target_chain_id != state.chain_id && instruction.target_chain_id != 0 {
-        return Err(PythContractError::InvalidGovernancePayload)?;
-    }
-
-    // Check that the instruction is intended for this target chain contract (as opposed to
-    // other Pyth contracts that may live on the same chain).
-    if instruction.module != GovernanceModule::Target {
-        return Err(PythContractError::InvalidGovernancePayload)?;
-    }
-
-    let response = match instruction.action {
-        UpgradeContract { code_id } => {
-            if instruction.target_chain_id == 0 {
-                Err(PythContractError::InvalidGovernancePayload)?
-            }
-            upgrade_contract(&env.contract.address, code_id)?
-        }
-        AuthorizeGovernanceDataSourceTransfer { claim_vaa } => {
-            let parsed_claim_vaa =
-                parse_and_verify_vaa(deps.as_ref(), env.block.time.seconds(), &claim_vaa)?;
-            transfer_governance(&mut updated_config, &state, &parsed_claim_vaa)?
-        }
-        SetDataSources { data_sources } => {
-            updated_config.data_sources = HashSet::from_iter(data_sources.iter().cloned());
-
-            Response::new()
-                .add_attribute("action", "set_data_sources")
-                .add_attribute("new_data_sources", format!("{data_sources:?}"))
-        }
-        SetFee { val, expo } => {
-            let new_fee_amount: u128 = (val as u128)
-                .checked_mul(
-                    10_u128
-                        .checked_pow(
-                            u32::try_from(expo)
-                                .map_err(|_| PythContractError::InvalidGovernancePayload)?,
-                        )
-                        .ok_or(PythContractError::InvalidGovernancePayload)?,
-                )
-                .ok_or(PythContractError::InvalidGovernancePayload)?;
-
-            updated_config.fee = Coin::new(new_fee_amount, updated_config.fee.denom.clone());
-
-            Response::new()
-                .add_attribute("action", "set_fee")
-                .add_attribute("new_fee", format!("{}", updated_config.fee))
-        }
-        SetValidPeriod { valid_seconds } => {
-            updated_config.valid_time_period = Duration::from_secs(valid_seconds);
-
-            Response::new()
-                .add_attribute("action", "set_valid_period")
-                .add_attribute("new_valid_seconds", format!("{valid_seconds}"))
-        }
-        RequestGovernanceDataSourceTransfer { .. } => {
-            // RequestGovernanceDataSourceTransfer can only be part of the
-            // AuthorizeGovernanceDataSourceTransfer message.
-            Err(PythContractError::InvalidGovernancePayload)?
-        }
-    };
-
-    config(deps.storage).save(&updated_config)?;
-
-    Ok(response)
-}
-
-/// Transfers governance to the data source provided in `parsed_claim_vaa`.
-/// This function updates the contract config in `next_config`; it is the caller's responsibility
-/// to save this configuration in the on-chain storage.
-fn transfer_governance(
-    next_config: &mut ConfigInfo,
-    current_config: &ConfigInfo,
-    parsed_claim_vaa: &ParsedVAA,
-) -> StdResult<Response<MsgWrapper>> {
-    let claim_vaa_instruction =
-        GovernanceInstruction::deserialize(parsed_claim_vaa.payload.as_slice())
-            .map_err(|_| PythContractError::InvalidGovernancePayload)?;
-
-    // Check that the requester is asking to govern this target chain contract.
-    // chain_id == 0 means they're asking for governance of all target chain contracts.
-    // (this check doesn't matter for security because we have already checked the information
-    // in the authorization message.)
-    if claim_vaa_instruction.target_chain_id != current_config.chain_id
-        && claim_vaa_instruction.target_chain_id != 0
-    {
-        Err(PythContractError::InvalidGovernancePayload)?
-    }
-
-    match claim_vaa_instruction.action {
-        RequestGovernanceDataSourceTransfer {
-            governance_data_source_index,
-        } => {
-            if current_config.governance_source_index != governance_data_source_index - 1 {
-                Err(PythContractError::InvalidGovernanceSourceIndex)?
-            }
-
-            next_config.governance_source_index = governance_data_source_index;
-            let new_governance_source = PythDataSource {
-                emitter:  Binary::from(parsed_claim_vaa.emitter_address.clone()),
-                chain_id: parsed_claim_vaa.emitter_chain,
-            };
-            next_config.governance_source = new_governance_source;
-            next_config.governance_sequence_number = parsed_claim_vaa.sequence;
-
-            Ok(Response::new()
-                .add_attribute("action", "authorize_governance_data_source_transfer")
-                .add_attribute(
-                    "new_governance_emitter_address",
-                    format!("{:?}", parsed_claim_vaa.emitter_address),
-                )
-                .add_attribute(
-                    "new_governance_emitter_chain",
-                    format!("{}", parsed_claim_vaa.emitter_chain),
-                )
-                .add_attribute(
-                    "new_governance_sequence_number",
-                    format!("{}", parsed_claim_vaa.sequence),
-                ))
-        }
-        _ => Err(PythContractError::InvalidGovernancePayload)?,
-    }
-}
-
-/// Upgrades the contract at `address` to `new_code_id` (by sending a `Migrate` message). The
-/// migration will fail unless this contract is the admin of the contract being upgraded.
-/// (Typically, `address` is this contract's address, and the contract is its own admin.)
-fn upgrade_contract(address: &Addr, new_code_id: u64) -> StdResult<Response<MsgWrapper>> {
-    Ok(Response::new()
-        .add_message(CosmosMsg::Wasm(WasmMsg::Migrate {
-            contract_addr: address.to_string(),
-            new_code_id,
-            msg: to_binary(&MigrateMsg {})?,
-        }))
-        .add_attribute("action", "upgrade_contract")
-        .add_attribute("new_code_id", format!("{new_code_id}")))
-}
-
 /// Check that `vaa` is from a valid data source (and hence is a legitimate price update message).
 fn verify_vaa_from_data_source(state: &ConfigInfo, vaa: &ParsedVAA) -> StdResult<()> {
     let vaa_data_source = PythDataSource {
-        emitter:  vaa.emitter_address.clone().into(),
+        emitter: vaa.emitter_address.clone().into(),
         chain_id: vaa.emitter_chain,
     };
+    println!("{:?}", vaa_data_source);
     if !state.data_sources.contains(&vaa_data_source) {
-        return Err(PythContractError::InvalidUpdateEmitter)?;
-    }
-    Ok(())
-}
-
-/// Check that `vaa` is from a valid governance source (and hence is a legitimate governance instruction).
-fn verify_vaa_from_governance_source(state: &ConfigInfo, vaa: &ParsedVAA) -> StdResult<()> {
-    let vaa_data_source = PythDataSource {
-        emitter:  vaa.emitter_address.clone().into(),
-        chain_id: vaa.emitter_chain,
-    };
-    if state.governance_source != vaa_data_source {
         return Err(PythContractError::InvalidUpdateEmitter)?;
     }
     Ok(())
@@ -497,11 +310,13 @@ fn apply_updates(
 ) -> StdResult<(usize, Vec<PriceFeed>)> {
     let mut num_total_attestations: usize = 0;
     let mut total_new_feeds: Vec<PriceFeed> = vec![];
-
     for datum in data {
         let feeds = parse_update(&deps.as_ref(), env, datum)?;
         num_total_attestations += feeds.len();
+        println!("{:?}", feeds);
+
         for feed in feeds {
+            println!("{:?}", feed);
             if update_price_feed_if_new(deps, env, feed)? {
                 total_new_feeds.push(feed);
             }
@@ -516,9 +331,8 @@ fn parse_accumulator(deps: &Deps, env: &Env, data: &[u8]) -> StdResult<Vec<Price
     match update_data.proof {
         Proof::WormholeMerkle { vaa, updates } => {
             let parsed_vaa = parse_and_verify_vaa(
-                *deps,
                 env.block.time.seconds(),
-                &Binary::from(Vec::from(vaa)),
+                &Binary::from(Vec::from(vaa)).clone().as_slice(),
             )?;
             let state = config_read(deps.storage).load()?;
             verify_vaa_from_data_source(&state, &parsed_vaa)?;
@@ -544,15 +358,15 @@ fn parse_accumulator(deps: &Deps, env: &Env, data: &[u8]) -> StdResult<Vec<Price
                         let price_feed = PriceFeed::new(
                             PriceIdentifier::new(price_feed_message.feed_id),
                             Price {
-                                price:        price_feed_message.price,
-                                conf:         price_feed_message.conf,
-                                expo:         price_feed_message.exponent,
+                                price: price_feed_message.price,
+                                conf: price_feed_message.conf,
+                                expo: price_feed_message.exponent,
                                 publish_time: price_feed_message.publish_time,
                             },
                             Price {
-                                price:        price_feed_message.ema_price,
-                                conf:         price_feed_message.ema_conf,
-                                expo:         price_feed_message.exponent,
+                                price: price_feed_message.ema_price,
+                                conf: price_feed_message.ema_conf,
+                                expo: price_feed_message.exponent,
                                 publish_time: price_feed_message.publish_time,
                             },
                         );
@@ -568,7 +382,7 @@ fn parse_accumulator(deps: &Deps, env: &Env, data: &[u8]) -> StdResult<Vec<Price
 
 /// Update the on-chain storage for any new price updates provided in `batch_attestation`.
 fn parse_batch_attestation(deps: &Deps, env: &Env, data: &Binary) -> StdResult<Vec<PriceFeed>> {
-    let vaa = parse_and_verify_vaa(*deps, env.block.time.seconds(), data)?;
+    let vaa = parse_and_verify_vaa(env.block.time.seconds(), data.as_slice())?;
     let state = config_read(deps.storage).load()?;
     verify_vaa_from_data_source(&state, &vaa)?;
     let data = &vaa.payload;
@@ -590,30 +404,30 @@ fn create_price_feed_from_price_attestation(price_attestation: &PriceAttestation
         PriceStatus::Trading => PriceFeed::new(
             PriceIdentifier::new(price_attestation.price_id.to_bytes()),
             Price {
-                price:        price_attestation.price,
-                conf:         price_attestation.conf,
-                expo:         price_attestation.expo,
+                price: price_attestation.price,
+                conf: price_attestation.conf,
+                expo: price_attestation.expo,
                 publish_time: price_attestation.publish_time,
             },
             Price {
-                price:        price_attestation.ema_price,
-                conf:         price_attestation.ema_conf,
-                expo:         price_attestation.expo,
+                price: price_attestation.ema_price,
+                conf: price_attestation.ema_conf,
+                expo: price_attestation.expo,
                 publish_time: price_attestation.publish_time,
             },
         ),
         _ => PriceFeed::new(
             PriceIdentifier::new(price_attestation.price_id.to_bytes()),
             Price {
-                price:        price_attestation.prev_price,
-                conf:         price_attestation.prev_conf,
-                expo:         price_attestation.expo,
+                price: price_attestation.prev_price,
+                conf: price_attestation.prev_conf,
+                expo: price_attestation.expo,
                 publish_time: price_attestation.prev_publish_time,
             },
             Price {
-                price:        price_attestation.ema_price,
-                conf:         price_attestation.ema_conf,
-                expo:         price_attestation.expo,
+                price: price_attestation.ema_price,
+                conf: price_attestation.ema_conf,
+                expo: price_attestation.expo,
                 publish_time: price_attestation.prev_publish_time,
             },
         ),
@@ -659,15 +473,9 @@ fn update_price_feed_if_new(
 pub fn query(deps: Deps, _env: Env, msg: QueryMsg) -> StdResult<Binary> {
     match msg {
         QueryMsg::PriceFeed { id } => to_binary(&query_price_feed(&deps, id.as_ref())?),
-        #[cfg(feature = "osmosis")]
-        QueryMsg::GetUpdateFeeForDenom { vaas, denom } => {
-            to_binary(&get_update_fee_for_denom(&deps, &vaas, denom)?)
-        }
-        QueryMsg::GetUpdateFee { vaas } => to_binary(&get_update_fee(&deps, &vaas)?),
         QueryMsg::GetValidTimePeriod => to_binary(&get_valid_time_period(&deps)?),
     }
 }
-
 
 /// This function is not used in the contract yet but mimicks the behavior implemented
 /// in the EVM contract. We are yet to finalize how the parsed prices should be consumed
@@ -682,9 +490,6 @@ pub fn parse_price_feed_updates(
     max_publish_time: UnixTimestamp,
 ) -> StdResult<Response<MsgWrapper>> {
     let _config = config_read(deps.storage).load()?;
-    if !is_fee_sufficient(&deps.as_ref(), info, updates)? {
-        return Err(PythContractError::InsufficientFee)?;
-    }
     let mut found_feeds = 0;
     let mut results: Vec<(Identifier, Option<PriceFeed>)> =
         price_feeds.iter().map(|id| (*id, None)).collect();
@@ -728,66 +533,6 @@ pub fn query_price_feed(deps: &Deps, feed_id: &[u8]) -> StdResult<PriceFeedRespo
     }
 }
 
-pub fn get_update_fee_amount(deps: &Deps, vaas: &[Binary]) -> StdResult<u128> {
-    let config = config_read(deps.storage).load()?;
-
-    let mut total_updates: u128 = 0;
-    for datum in vaas {
-        let header = datum.get(0..4);
-        if header == Some(PYTHNET_ACCUMULATOR_UPDATE_MAGIC.as_slice()) {
-            let update_data = AccumulatorUpdateData::try_from_slice(datum)
-                .map_err(|_| PythContractError::InvalidAccumulatorPayload)?;
-            match update_data.proof {
-                Proof::WormholeMerkle { vaa: _, updates } => {
-                    total_updates += updates.len() as u128;
-                }
-            }
-        } else {
-            total_updates += 1;
-        }
-    }
-
-    Ok(config
-        .fee
-        .amount
-        .u128()
-        .checked_mul(total_updates)
-        .ok_or(OverflowError::new(
-            OverflowOperation::Mul,
-            config.fee.amount,
-            total_updates,
-        ))?)
-}
-
-/// Get the fee that a caller must pay in order to submit a price update.
-/// The fee depends on both the current contract configuration and the update data `vaas`.
-/// The fee is in the denoms as stored in the current configuration
-pub fn get_update_fee(deps: &Deps, vaas: &[Binary]) -> StdResult<Coin> {
-    let config = config_read(deps.storage).load()?;
-    Ok(coin(get_update_fee_amount(deps, vaas)?, config.fee.denom))
-}
-
-#[cfg(feature = "osmosis")]
-/// Osmosis can support multiple tokens for transaction fees
-/// This will return update fee for the given denom only if that denom is allowed in Osmosis's txFee module
-/// Else it will throw error
-pub fn get_update_fee_for_denom(deps: &Deps, vaas: &[Binary], denom: String) -> StdResult<Coin> {
-    let config = config_read(deps.storage).load()?;
-
-    // if the denom is not a base denom it should be an allowed one
-    if denom != config.fee.denom && !is_allowed_tx_fees_denom(deps, &denom) {
-        return Err(PythContractError::InvalidFeeDenom { denom })?;
-    }
-
-    // the base fee is set to -> denom = base denom of a chain, amount = 1
-    // which is very minimal
-    // for other valid denoms too we are using the base amount as 1
-    // base amount is multiplied to number of vaas to get the total amount
-
-    // this will be change later on to add custom logic using spot price for valid tokens
-    Ok(coin(get_update_fee_amount(deps, vaas)?, denom))
-}
-
 pub fn get_valid_time_period(deps: &Deps) -> StdResult<Duration> {
     Ok(config_read(deps.storage).load()?.valid_time_period)
 }
@@ -796,82 +541,57 @@ pub fn get_valid_time_period(deps: &Deps) -> StdResult<Duration> {
 mod test {
     use {
         super::*,
-        crate::{
-            governance::GovernanceModule::{
-                Executor,
-                Target,
-            },
-            state::get_contract_version,
-        },
+        crate::state::get_contract_version,
         cosmwasm_std::{
-            coins,
-            from_binary,
-            testing::{
-                mock_dependencies,
-                mock_env,
-                mock_info,
-                MockApi,
-                MockQuerier,
-                MockStorage,
-            },
-            Addr,
-            ContractResult,
-            OwnedDeps,
-            QuerierResult,
-            StdError,
-            SystemError,
-            SystemResult,
+            coins, from_binary,
+            testing::{mock_dependencies, mock_env, mock_info, MockApi, MockQuerier, MockStorage},
+            Addr, ContractResult, OwnedDeps, QuerierResult, StdError, SystemError, SystemResult,
             Uint128,
         },
         pyth_sdk::UnixTimestamp,
         pyth_sdk_cw::PriceIdentifier,
         pyth_wormhole_attester_sdk::PriceAttestation,
         pythnet_sdk::{
-            accumulators::{
-                merkle::MerkleTree,
-                Accumulator,
-            },
-            messages::{
-                PriceFeedMessage,
-                TwapMessage,
-            },
+            accumulators::{merkle::MerkleTree, Accumulator},
+            messages::{PriceFeedMessage, TwapMessage},
             test_utils::{
-                create_accumulator_message,
-                create_accumulator_message_from_updates,
-                create_dummy_price_feed_message,
-                create_vaa_from_payload,
-                DEFAULT_CHAIN_ID,
-                DEFAULT_DATA_SOURCE,
-                DEFAULT_GOVERNANCE_SOURCE,
-                DEFAULT_VALID_TIME_PERIOD,
-                SECONDARY_GOVERNANCE_SOURCE,
-                WRONG_CHAIN_ID,
-                WRONG_SOURCE,
+                create_accumulator_message, create_accumulator_message_from_updates,
+                create_dummy_price_feed_message, create_vaa_from_payload, DEFAULT_CHAIN_ID,
+                DEFAULT_DATA_SOURCE, DEFAULT_GOVERNANCE_SOURCE, DEFAULT_VALID_TIME_PERIOD,
+                SECONDARY_GOVERNANCE_SOURCE, WRONG_CHAIN_ID, WRONG_SOURCE,
             },
-            wire::{
-                to_vec,
-                v1::MerklePriceUpdate,
-                PrefixedVec,
-            },
+            wire::{to_vec, v1::MerklePriceUpdate, PrefixedVec},
         },
         serde_wormhole::RawMessage,
         std::time::Duration,
-        wormhole_sdk::{
-            Address,
-            Chain,
-            Vaa,
-        },
+        wormhole_sdk::{Address, Chain, Vaa},
     };
 
     /// Default valid time period for testing purposes.
     const WORMHOLE_ADDR: &str = "Wormhole";
 
-    fn default_config_info() -> ConfigInfo {
+    fn hex_to_vec(hex: &str) -> Result<Vec<u8>, String> {
+        if hex.len() % 2 != 0 {
+            return Err("Hex string must have an even length".into());
+        }
+
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| {
+                u8::from_str_radix(&hex[i..i + 2], 16)
+                    .map_err(|e| format!("Invalid hex string: {}", e))
+            })
+            .collect()
+    }
+
+
+    fn arb_config_info() -> ConfigInfo {
         ConfigInfo {
             wormhole_contract: Addr::unchecked(WORMHOLE_ADDR),
             data_sources: create_data_sources(
-                DEFAULT_DATA_SOURCE.address.0.to_vec(),
-                DEFAULT_DATA_SOURCE.chain.into(),
+                hex_to_vec("e101faedac5851e32b9b23b5f9411a8c2bac4aae3ed4dd7b811dd1a72ea4aa71")
+                    .unwrap(),
+                26,
             ),
             ..create_zero_config_info()
         }
@@ -902,7 +622,7 @@ mod test {
                         ))
                     }
                     Err(_e) => SystemResult::Err(SystemError::InvalidRequest {
-                        error:   "Invalid message".into(),
+                        error: "Invalid message".into(),
                         request: msg.clone(),
                     }),
                     _ => SystemResult::Err(SystemError::NoSuchContract {
@@ -929,1425 +649,58 @@ mod test {
         }
     }
 
-    fn create_batch_price_update_msg(
-        emitter_address: Address,
-        emitter_chain: Chain,
-        attestations: Vec<PriceAttestation>,
-    ) -> Binary {
-        let batch_attestation = BatchPriceAttestation {
-            price_attestations: attestations,
-        };
-
-        let vaa = create_vaa_from_payload(
-            &batch_attestation.serialize().unwrap(),
-            emitter_address,
-            emitter_chain,
-            0,
-        );
-        serde_wormhole::to_vec(&vaa).unwrap().into()
-    }
-
-    fn create_batch_price_update_msg_from_attestations(
-        attestations: Vec<PriceAttestation>,
-    ) -> Binary {
-        create_batch_price_update_msg(
-            DEFAULT_DATA_SOURCE.address,
-            DEFAULT_DATA_SOURCE.chain,
-            attestations,
-        )
-    }
-
 
     fn create_zero_config_info() -> ConfigInfo {
         ConfigInfo {
-            wormhole_contract:          Addr::unchecked(String::default()),
-            data_sources:               HashSet::default(),
-            governance_source:          PythDataSource {
-                emitter:  Binary(vec![]),
+            wormhole_contract: Addr::unchecked(String::default()),
+            data_sources: HashSet::default(),
+            governance_source: PythDataSource {
+                emitter: Binary(vec![]),
                 chain_id: 0,
             },
-            governance_source_index:    0,
+            governance_source_index: 0,
             governance_sequence_number: 0,
-            chain_id:                   0,
-            valid_time_period:          Duration::new(0, 0),
-            fee:                        Coin::new(0, ""),
+            chain_id: 0,
+            valid_time_period: Duration::new(0, 0),
+            fee: Coin::new(0, ""),
         }
     }
 
-    fn create_price_feed(expo: i32, publish_time: UnixTimestamp) -> PriceFeed {
-        PriceFeed::new(
-            PriceIdentifier::new([0u8; 32]),
-            Price {
-                expo,
-                publish_time,
-                ..Default::default()
-            },
-            Price {
-                expo,
-                ..Default::default()
-            },
-        )
-    }
 
     fn create_data_sources(
         pyth_emitter: Vec<u8>,
         pyth_emitter_chain: u16,
     ) -> HashSet<PythDataSource> {
         HashSet::from([PythDataSource {
-            emitter:  pyth_emitter.into(),
+            emitter: pyth_emitter.into(),
             chain_id: pyth_emitter_chain,
         }])
     }
 
-    /// Updates the price feed with the given publish time stamp and
-    /// returns the update status (true means updated, false means ignored)
-    fn do_update_price_feed(deps: &mut DepsMut, env: &Env, price_feed: PriceFeed) -> bool {
-        update_price_feed_if_new(deps, env, price_feed).unwrap()
-    }
-
-    fn apply_price_update(
-        config_info: &ConfigInfo,
-        emitter_address: Address,
-        emitter_chain: Chain,
-        attestations: Vec<PriceAttestation>,
-    ) -> StdResult<(usize, Vec<PriceFeed>)> {
-        let (mut deps, env) = setup_test();
-        config(&mut deps.storage).save(config_info).unwrap();
-        let msg = create_batch_price_update_msg(emitter_address, emitter_chain, attestations);
-        apply_updates(&mut deps.as_mut(), &env, &[msg])
-    }
-
-    #[test]
-    fn test_instantiate() {
-        let mut deps = mock_dependencies();
-
-        let instantiate_msg = InstantiateMsg {
-            // this is an example wormhole contract address in order to create a valid instantiate message
-            wormhole_contract:          String::from("inj1xx3aupmgv3ce537c0yce8zzd3sz567syuyedpg"),
-            data_sources:               Vec::new(),
-            governance_source:          PythDataSource {
-                emitter:  Binary(vec![]),
-                chain_id: 0,
-            },
-            governance_source_index:    0,
-            governance_sequence_number: 0,
-            chain_id:                   0,
-            valid_time_period_secs:     0,
-            fee:                        Coin::new(0, ""),
-        };
-
-        let res = instantiate(
-            deps.as_mut(),
-            mock_env(),
-            MessageInfo {
-                sender: Addr::unchecked(""),
-                funds:  Vec::new(),
-            },
-            instantiate_msg,
-        );
-        assert!(res.is_ok());
-
-        // check config
-        let config_result = config(&mut deps.storage).load();
-        assert!(config_result.is_ok());
-
-        // check contract version
-        let contract_version = get_contract_version(&mut deps.storage);
-        assert_eq!(contract_version, Ok(String::from(CONTRACT_VERSION)));
-    }
-
-    #[test]
-    fn test_instantiate_invalid_wormhole_address() {
-        let mut deps = mock_dependencies();
-
-        let instantiate_msg = InstantiateMsg {
-            wormhole_contract:          String::from(""),
-            data_sources:               Vec::new(),
-            governance_source:          PythDataSource {
-                emitter:  Binary(vec![]),
-                chain_id: 0,
-            },
-            governance_source_index:    0,
-            governance_sequence_number: 0,
-            chain_id:                   0,
-            valid_time_period_secs:     0,
-            fee:                        Coin::new(0, ""),
-        };
-
-        let res = instantiate(
-            deps.as_mut(),
-            mock_env(),
-            MessageInfo {
-                sender: Addr::unchecked(""),
-                funds:  Vec::new(),
-            },
-            instantiate_msg,
-        );
-        assert!(res.is_err());
-    }
-
-
-    #[cfg(feature = "osmosis")]
-    fn check_sufficient_fee(deps: &Deps, data: &[Binary]) {
-        let mut info = mock_info("123", coins(100, "foo").as_slice());
-        let result = is_fee_sufficient(deps, info.clone(), data);
-        assert_eq!(result, Ok(true));
-
-        // insufficient fee in base denom -> false
-        info.funds = coins(50, "foo");
-        let result = is_fee_sufficient(deps, info.clone(), data);
-        assert_eq!(result, Ok(false));
-
-        // valid denoms are 'uion' or 'ibc/FF3065989E34457F342D4EFB8692406D49D4E2B5C70F725F127862E22CE6BDCD'
-        // a valid denom other than base denom with sufficient fee
-        info.funds = coins(100, "uion");
-        let result = is_fee_sufficient(deps, info.clone(), data);
-        assert_eq!(result, Ok(true));
-
-        // insufficient fee in valid denom -> false
-        info.funds = coins(50, "uion");
-        let result = is_fee_sufficient(deps, info.clone(), data);
-        assert_eq!(result, Ok(false));
-
-        // an invalid denom -> Err invalid fee denom
-        info.funds = coins(100, "invalid_denom");
-        let result = is_fee_sufficient(deps, info, data);
-        assert_eq!(
-            result,
-            Err(PythContractError::InvalidFeeDenom {
-                denom: "invalid_denom".to_string(),
-            }
-            .into())
-        );
-    }
-
-    #[cfg(not(feature = "osmosis"))]
-    fn check_sufficient_fee(deps: &Deps, data: &[Binary]) {
-        let mut info = mock_info("123", coins(100, "foo").as_slice());
-
-        // sufficient fee -> true
-        let result = is_fee_sufficient(deps, info.clone(), data);
-        assert_eq!(result, Ok(true));
-
-        // insufficient fee -> false
-        info.funds = coins(50, "foo");
-        let result = is_fee_sufficient(deps, info.clone(), data);
-        assert_eq!(result, Ok(false));
-
-        // insufficient fee -> false
-        info.funds = coins(150, "bar");
-        let result = is_fee_sufficient(deps, info, data);
-        assert_eq!(result, Ok(false));
-    }
-
-    #[test]
-    fn test_is_fee_sufficient() {
-        let mut config_info = default_config_info();
-        config_info.fee = Coin::new(100, "foo");
-
-        let (mut deps, _env) = setup_test();
-        config(&mut deps.storage).save(&config_info).unwrap();
-        let data = [create_batch_price_update_msg_from_attestations(vec![
-            PriceAttestation::default(),
-        ])];
-        check_sufficient_fee(&deps.as_ref(), &data);
-
-        let feed1 = create_dummy_price_feed_message(100);
-        let feed2 = create_dummy_price_feed_message(200);
-        let feed3 = create_dummy_price_feed_message(300);
-        let data = create_accumulator_message(&[feed1, feed2, feed3], &[feed1], false, false);
-        check_sufficient_fee(&deps.as_ref(), &[data.into()])
-    }
-
-    #[test]
-    fn test_parse_batch_attestation_empty_array() {
-        let (num_attestations, new_attestations) = apply_price_update(
-            &default_config_info(),
-            DEFAULT_DATA_SOURCE.address,
-            DEFAULT_DATA_SOURCE.chain,
-            vec![],
-        )
-        .unwrap();
-
-        assert_eq!(num_attestations, 0);
-        assert_eq!(new_attestations.len(), 0);
-    }
-
-    fn check_price_match(deps: &OwnedDeps<MockStorage, MockApi, MockQuerier>, msg: &Message) {
-        match msg {
-            Message::PriceFeedMessage(feed_msg) => {
-                let feed = price_feed_read_bucket(&deps.storage)
-                    .load(&feed_msg.feed_id)
-                    .unwrap();
-                let price = feed.get_price_unchecked();
-                let ema_price = feed.get_ema_price_unchecked();
-                assert_eq!(price.price, feed_msg.price);
-                assert_eq!(price.conf, feed_msg.conf);
-                assert_eq!(price.expo, feed_msg.exponent);
-                assert_eq!(price.publish_time, feed_msg.publish_time);
-
-                assert_eq!(ema_price.price, feed_msg.ema_price);
-                assert_eq!(ema_price.conf, feed_msg.ema_conf);
-                assert_eq!(ema_price.expo, feed_msg.exponent);
-                assert_eq!(ema_price.publish_time, feed_msg.publish_time);
-            }
-            _ => assert!(false, "invalid message type"),
-        };
-    }
-
-    fn test_accumulator_wrong_source(emitter_address: Address, emitter_chain: Chain) {
-        let (mut deps, env) = setup_test();
-        config(&mut deps.storage)
-            .save(&default_config_info())
-            .unwrap();
-
-        let feed1 = create_dummy_price_feed_message(100);
-        let feed1_bytes = to_vec::<_, BigEndian>(&feed1).unwrap();
-        let tree = MerkleTree::<Keccak160>::new(&[feed1_bytes.as_slice()]).unwrap();
-        let mut price_updates: Vec<MerklePriceUpdate> = vec![];
-        let proof1 = tree.prove(&feed1_bytes).unwrap();
-        price_updates.push(MerklePriceUpdate {
-            message: PrefixedVec::from(feed1_bytes),
-            proof:   proof1,
-        });
-        let msg = create_accumulator_message_from_updates(
-            price_updates,
-            tree,
-            false,
-            emitter_address,
-            emitter_chain,
-        );
-        let info = mock_info("123", &[]);
-        let result = update_price_feeds(deps.as_mut(), env, info, &[msg.into()]);
-        assert!(result.is_err());
-        assert_eq!(result, Err(PythContractError::InvalidUpdateEmitter.into()));
-    }
-
-    #[test]
-    fn test_accumulator_verify_vaa_sender_fail_wrong_emitter_address() {
-        test_accumulator_wrong_source(WRONG_SOURCE.address, DEFAULT_DATA_SOURCE.chain);
-    }
-
-    #[test]
-    fn test_accumulator_verify_vaa_sender_fail_wrong_emitter_chain() {
-        test_accumulator_wrong_source(DEFAULT_DATA_SOURCE.address, WRONG_SOURCE.chain);
-    }
-
-    #[test]
-    fn test_accumulator_get_update_fee_amount() {
-        let mut config_info = default_config_info();
-        config_info.fee = Coin::new(100, "foo");
-
-        let (mut deps, _env) = setup_test();
-        config(&mut deps.storage).save(&config_info).unwrap();
-
-
-        let feed1 = create_dummy_price_feed_message(100);
-        let feed2 = create_dummy_price_feed_message(200);
-        let feed3 = create_dummy_price_feed_message(300);
-
-        let msg = create_accumulator_message(&[feed1, feed2, feed3], &[feed1, feed3], false, false);
-        assert_eq!(
-            get_update_fee_amount(&deps.as_ref(), &[msg.into()]).unwrap(),
-            200
-        );
-
-        let msg = create_accumulator_message(&[feed1, feed2, feed3], &[feed1], false, false);
-        assert_eq!(
-            get_update_fee_amount(&deps.as_ref(), &[msg.into()]).unwrap(),
-            100
-        );
-
-        let msg = create_accumulator_message(
-            &[feed1, feed2, feed3],
-            &[feed1, feed2, feed3, feed1, feed3],
-            false,
-            false,
-        );
-        assert_eq!(
-            get_update_fee_amount(&deps.as_ref(), &[msg.into()]).unwrap(),
-            500
-        );
-
-        let batch_msg =
-            create_batch_price_update_msg_from_attestations(vec![PriceAttestation::default()]);
-        let msg = create_accumulator_message(
-            &[feed1, feed2, feed3],
-            &[feed1, feed2, feed3],
-            false,
-            false,
-        );
-        assert_eq!(
-            get_update_fee_amount(&deps.as_ref(), &[msg.into(), batch_msg]).unwrap(),
-            400
-        );
-    }
-
-
-    #[test]
-    fn test_accumulator_message_single_update() {
-        let (mut deps, env) = setup_test();
-        config(&mut deps.storage)
-            .save(&default_config_info())
-            .unwrap();
-
-        let feed1 = create_dummy_price_feed_message(100);
-        let feed2 = create_dummy_price_feed_message(200);
-        let msg = create_accumulator_message(&[feed1, feed2], &[feed1], false, false);
-        let info = mock_info("123", &[]);
-        let result = update_price_feeds(deps.as_mut(), env, info, &[msg.into()]);
-        assert!(result.is_ok());
-        check_price_match(&deps, &feed1);
-    }
-
-    #[test]
-    fn test_accumulator_message_multi_update_many_feeds() {
-        let (mut deps, env) = setup_test();
-        config(&mut deps.storage)
-            .save(&default_config_info())
-            .unwrap();
-        let mut all_feeds: Vec<Message> = vec![];
-        for i in 0..10000 {
-            all_feeds.push(create_dummy_price_feed_message(i));
+    fn hex_to_binary(hex: &str) -> Result<Binary, String> {
+        if hex.len() % 2 != 0 {
+            return Err("Hex string must have an even length".into());
         }
-        let msg = create_accumulator_message(&all_feeds, &all_feeds[100..110], false, false);
-        let info = mock_info("123", &[]);
-        let result = update_price_feeds(deps.as_mut(), env, info, &[msg.into()]);
-        assert!(result.is_ok());
-        for i in 100..110 {
-            check_price_match(&deps, &all_feeds[i]);
-        }
-    }
 
-    fn as_mut_price_feed(msg: &mut Message) -> &mut PriceFeedMessage {
-        match msg {
-            Message::PriceFeedMessage(ref mut price_feed) => price_feed,
-            _ => {
-                panic!("unexpected message type");
-            }
-        }
-    }
-
-    #[test]
-    fn test_accumulator_multi_message_multi_update() {
-        let (mut deps, env) = setup_test();
-        config(&mut deps.storage)
-            .save(&default_config_info())
-            .unwrap();
-        let mut feed1 = create_dummy_price_feed_message(100);
-        let mut feed2 = create_dummy_price_feed_message(200);
-        let mut feed3 = create_dummy_price_feed_message(300);
-        let msg = create_accumulator_message(
-            &[feed1, feed2, feed3],
-            &[feed1, feed2, feed3],
-            false,
-            false,
-        );
-        as_mut_price_feed(&mut feed1).publish_time += 1;
-        as_mut_price_feed(&mut feed2).publish_time += 1;
-        as_mut_price_feed(&mut feed3).publish_time += 1;
-        as_mut_price_feed(&mut feed1).price *= 2;
-        as_mut_price_feed(&mut feed2).price *= 2;
-        as_mut_price_feed(&mut feed3).price *= 2;
-        let msg2 = create_accumulator_message(
-            &[feed1, feed2, feed3],
-            &[feed1, feed2, feed3],
-            false,
-            false,
-        );
-        let info = mock_info("123", &[]);
-        let result = update_price_feeds(deps.as_mut(), env, info, &[msg.into(), msg2.into()]);
-
-        assert!(result.is_ok());
-        check_price_match(&deps, &feed1);
-        check_price_match(&deps, &feed2);
-        check_price_match(&deps, &feed3);
-    }
-
-    #[test]
-    fn test_accumulator_multi_update_out_of_order() {
-        let (mut deps, env) = setup_test();
-        config(&mut deps.storage)
-            .save(&default_config_info())
-            .unwrap();
-        let feed1 = create_dummy_price_feed_message(100);
-        let mut feed2 = create_dummy_price_feed_message(100);
-        let feed3 = create_dummy_price_feed_message(300);
-        as_mut_price_feed(&mut feed2).publish_time -= 1;
-        as_mut_price_feed(&mut feed2).price *= 2;
-        let msg = create_accumulator_message(
-            &[feed1, feed2, feed3],
-            &[feed1, feed2, feed3],
-            false,
-            false,
-        );
-        let info = mock_info("123", &[]);
-        let result = update_price_feeds(deps.as_mut(), env, info, &[msg.into()]);
-
-        assert!(result.is_ok());
-        check_price_match(&deps, &feed1);
-        check_price_match(&deps, &feed3);
-    }
-
-    #[test]
-    fn test_accumulator_multi_message_multi_update_out_of_order() {
-        let (mut deps, env) = setup_test();
-        config(&mut deps.storage)
-            .save(&default_config_info())
-            .unwrap();
-        let feed1 = create_dummy_price_feed_message(100);
-        let mut feed2 = create_dummy_price_feed_message(100);
-        let feed3 = create_dummy_price_feed_message(300);
-        as_mut_price_feed(&mut feed2).publish_time -= 1;
-        as_mut_price_feed(&mut feed2).price *= 2;
-        let msg = create_accumulator_message(&[feed1, feed2, feed3], &[feed1, feed3], false, false);
-
-        let msg2 =
-            create_accumulator_message(&[feed1, feed2, feed3], &[feed2, feed3], false, false);
-        let info = mock_info("123", &[]);
-        let result = update_price_feeds(deps.as_mut(), env, info, &[msg.into(), msg2.into()]);
-
-        assert!(result.is_ok());
-        check_price_match(&deps, &feed1);
-        check_price_match(&deps, &feed3);
-    }
-
-    #[test]
-    fn test_invalid_accumulator_update() {
-        let (mut deps, env) = setup_test();
-        config(&mut deps.storage)
-            .save(&default_config_info())
-            .unwrap();
-
-        let feed1 = create_dummy_price_feed_message(100);
-        let mut msg = create_accumulator_message(&[feed1], &[feed1], false, false);
-        msg[4] = 3; // major version
-        let info = mock_info("123", &[]);
-        let result = update_price_feeds(deps.as_mut(), env, info, &[msg.into()]);
-        assert!(result.is_err());
-        assert_eq!(
-            result.unwrap_err(),
-            StdError::from(PythContractError::InvalidAccumulatorPayload)
-        );
-    }
-
-    #[test]
-    fn test_invalid_wormhole_message() {
-        let (mut deps, env) = setup_test();
-        config(&mut deps.storage)
-            .save(&default_config_info())
-            .unwrap();
-
-        let feed1 = create_dummy_price_feed_message(100);
-        let msg = create_accumulator_message(&[feed1], &[feed1], true, false);
-        let info = mock_info("123", &[]);
-        let result = update_price_feeds(deps.as_mut(), env, info, &[msg.into()]);
-        assert!(result.is_err());
-        assert_eq!(
-            result.unwrap_err(),
-            StdError::from(PythContractError::InvalidWormholeMessage)
-        );
-    }
-
-    #[test]
-    fn test_invalid_accumulator_message_type() {
-        let (mut deps, env) = setup_test();
-        config(&mut deps.storage)
-            .save(&default_config_info())
-            .unwrap();
-        // Although Twap Message is a valid message but it won't get stored on-chain via
-        // `update_price_feeds` and (will be) used in other methods
-        let feed1 = Message::TwapMessage(TwapMessage {
-            feed_id:           [0; 32],
-            cumulative_price:  0,
-            cumulative_conf:   0,
-            num_down_slots:    0,
-            exponent:          0,
-            publish_time:      0,
-            prev_publish_time: 0,
-            publish_slot:      0,
-        });
-        let msg = create_accumulator_message(&[feed1], &[feed1], false, false);
-        let info = mock_info("123", &[]);
-        let result = update_price_feeds(deps.as_mut(), env, info, &[msg.into()]);
-        assert!(result.is_err());
-        assert_eq!(
-            result.unwrap_err(),
-            StdError::from(PythContractError::InvalidAccumulatorMessageType)
-        );
-    }
-
-    #[test]
-    fn test_invalid_proof() {
-        let (mut deps, env) = setup_test();
-        config(&mut deps.storage)
-            .save(&default_config_info())
-            .unwrap();
-
-        let feed1 = create_dummy_price_feed_message(100);
-        let feed2 = create_dummy_price_feed_message(200);
-        let feed1_bytes = to_vec::<_, BigEndian>(&feed1).unwrap();
-        let feed2_bytes = to_vec::<_, BigEndian>(&feed2).unwrap();
-        let tree = MerkleTree::<Keccak160>::new(&[feed1_bytes.as_slice()]).unwrap();
-        let mut price_updates: Vec<MerklePriceUpdate> = vec![];
-
-        let proof1 = tree.prove(&feed1_bytes).unwrap();
-        price_updates.push(MerklePriceUpdate {
-            // proof1 is valid for feed1, but not feed2
-            message: PrefixedVec::from(feed2_bytes),
-            proof:   proof1,
-        });
-        let msg = create_accumulator_message_from_updates(
-            price_updates,
-            tree,
-            false,
-            DEFAULT_DATA_SOURCE.address,
-            DEFAULT_DATA_SOURCE.chain,
-        );
-        let info = mock_info("123", &[]);
-        let result = update_price_feeds(deps.as_mut(), env, info, &[msg.into()]);
-        assert!(result.is_err());
-        assert_eq!(
-            result.unwrap_err(),
-            StdError::from(PythContractError::InvalidMerkleProof)
-        );
-    }
-
-    #[test]
-    fn test_invalid_message() {
-        let (mut deps, env) = setup_test();
-        config(&mut deps.storage)
-            .save(&default_config_info())
-            .unwrap();
-
-        let feed1 = create_dummy_price_feed_message(100);
-        let mut feed1_bytes = to_vec::<_, BigEndian>(&feed1).unwrap();
-        feed1_bytes.pop();
-        let tree = MerkleTree::<Keccak160>::new(&[feed1_bytes.as_slice()]).unwrap();
-        let mut price_updates: Vec<MerklePriceUpdate> = vec![];
-
-        let proof1 = tree.prove(&feed1_bytes).unwrap();
-        price_updates.push(MerklePriceUpdate {
-            message: PrefixedVec::from(feed1_bytes),
-            proof:   proof1,
-        });
-        let msg = create_accumulator_message_from_updates(
-            price_updates,
-            tree,
-            false,
-            DEFAULT_DATA_SOURCE.address,
-            DEFAULT_DATA_SOURCE.chain,
-        );
-        let info = mock_info("123", &[]);
-        let result = update_price_feeds(deps.as_mut(), env, info, &[msg.into()]);
-        assert!(result.is_err());
-        assert_eq!(
-            result.unwrap_err(),
-            StdError::from(PythContractError::InvalidAccumulatorMessage)
-        );
-    }
-
-    #[test]
-    fn test_create_price_feed_from_price_attestation_status_trading() {
-        let price_attestation = PriceAttestation {
-            price_id: pyth_wormhole_attester_sdk::Identifier::new([0u8; 32]),
-            price: 100,
-            conf: 100,
-            expo: 100,
-            ema_price: 100,
-            ema_conf: 100,
-            status: PriceStatus::Trading,
-            attestation_time: 100,
-            publish_time: 100,
-            prev_publish_time: 99,
-            prev_price: 99,
-            prev_conf: 99,
-            ..Default::default()
-        };
-
-        let price_feed = create_price_feed_from_price_attestation(&price_attestation);
-        let price = price_feed.get_price_unchecked();
-        let ema_price = price_feed.get_ema_price_unchecked();
-
-        // for price
-        assert_eq!(price.price, 100);
-        assert_eq!(price.conf, 100);
-        assert_eq!(price.expo, 100);
-        assert_eq!(price.publish_time, 100);
-
-        // for ema
-        assert_eq!(ema_price.price, 100);
-        assert_eq!(ema_price.conf, 100);
-        assert_eq!(ema_price.expo, 100);
-        assert_eq!(ema_price.publish_time, 100);
-    }
-
-    #[test]
-    fn test_create_price_feed_from_price_attestation_status_unknown() {
-        test_create_price_feed_from_price_attestation_not_trading(PriceStatus::Unknown)
-    }
-
-    #[test]
-    fn test_create_price_feed_from_price_attestation_status_halted() {
-        test_create_price_feed_from_price_attestation_not_trading(PriceStatus::Halted)
-    }
-
-    #[test]
-    fn test_create_price_feed_from_price_attestation_status_auction() {
-        test_create_price_feed_from_price_attestation_not_trading(PriceStatus::Auction)
-    }
-
-    fn test_create_price_feed_from_price_attestation_not_trading(status: PriceStatus) {
-        let price_attestation = PriceAttestation {
-            price_id: pyth_wormhole_attester_sdk::Identifier::new([0u8; 32]),
-            price: 100,
-            conf: 100,
-            expo: 100,
-            ema_price: 100,
-            ema_conf: 100,
-            status,
-            attestation_time: 100,
-            publish_time: 100,
-            prev_publish_time: 99,
-            prev_price: 99,
-            prev_conf: 99,
-            ..Default::default()
-        };
-
-        let price_feed = create_price_feed_from_price_attestation(&price_attestation);
-
-        let price = price_feed.get_price_unchecked();
-        let ema_price = price_feed.get_ema_price_unchecked();
-
-        // for price
-        assert_eq!(price.price, 99);
-        assert_eq!(price.conf, 99);
-        assert_eq!(price.expo, 100);
-        assert_eq!(price.publish_time, 99);
-
-        // for ema
-        assert_eq!(ema_price.price, 100);
-        assert_eq!(ema_price.conf, 100);
-        assert_eq!(ema_price.expo, 100);
-        assert_eq!(ema_price.publish_time, 99);
-    }
-
-    #[test]
-    fn test_parse_batch_attestation_status_not_trading() {
-        let (mut deps, env) = setup_test();
-
-        let price_attestation = PriceAttestation {
-            price_id: pyth_wormhole_attester_sdk::Identifier::new([0u8; 32]),
-            price: 100,
-            conf: 100,
-            expo: 100,
-            ema_price: 100,
-            ema_conf: 100,
-            status: PriceStatus::Auction,
-            attestation_time: 100,
-            publish_time: 100,
-            prev_publish_time: 99,
-            prev_price: 99,
-            prev_conf: 99,
-            ..Default::default()
-        };
-
-        config(&mut deps.storage)
-            .save(&default_config_info())
-            .unwrap();
-        let msg = create_batch_price_update_msg_from_attestations(vec![price_attestation]);
-        let feeds = parse_batch_attestation(&deps.as_ref(), &env, &msg).unwrap();
-        assert_eq!(feeds.len(), 1);
-        let price = feeds[0].get_price_unchecked();
-        let ema_price = feeds[0].get_ema_price_unchecked();
-
-        // for price
-        assert_eq!(price.price, 99);
-        assert_eq!(price.conf, 99);
-        assert_eq!(price.expo, 100);
-        assert_eq!(price.publish_time, 99);
-
-        // for ema
-        assert_eq!(ema_price.price, 100);
-        assert_eq!(ema_price.conf, 100);
-        assert_eq!(ema_price.expo, 100);
-        assert_eq!(ema_price.publish_time, 99);
-    }
-
-    #[test]
-    fn test_parse_batch_attestation_status_trading() {
-        let (mut deps, env) = setup_test();
-
-        let price_attestation = PriceAttestation {
-            price_id: pyth_wormhole_attester_sdk::Identifier::new([0u8; 32]),
-            price: 100,
-            conf: 100,
-            expo: 100,
-            ema_price: 100,
-            ema_conf: 100,
-            status: PriceStatus::Trading,
-            attestation_time: 100,
-            publish_time: 100,
-            prev_publish_time: 99,
-            prev_price: 99,
-            prev_conf: 99,
-            ..Default::default()
-        };
-
-        config(&mut deps.storage)
-            .save(&default_config_info())
-            .unwrap();
-        let msg = create_batch_price_update_msg_from_attestations(vec![price_attestation]);
-        let feeds = parse_batch_attestation(&deps.as_ref(), &env, &msg).unwrap();
-        assert_eq!(feeds.len(), 1);
-        let price = feeds[0].get_price_unchecked();
-        let ema_price = feeds[0].get_ema_price_unchecked();
-
-        // for price
-        assert_eq!(price.price, 100);
-        assert_eq!(price.conf, 100);
-        assert_eq!(price.expo, 100);
-        assert_eq!(price.publish_time, 100);
-
-        // for ema
-        assert_eq!(ema_price.price, 100);
-        assert_eq!(ema_price.conf, 100);
-        assert_eq!(ema_price.expo, 100);
-        assert_eq!(ema_price.publish_time, 100);
-    }
-
-    #[test]
-    fn test_verify_vaa_sender_ok() {
-        let result = apply_price_update(
-            &default_config_info(),
-            DEFAULT_DATA_SOURCE.address,
-            DEFAULT_DATA_SOURCE.chain,
-            vec![PriceAttestation::default()],
-        );
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_verify_vaa_sender_fail_wrong_emitter_address() {
-        let result = apply_price_update(
-            &default_config_info(),
-            WRONG_SOURCE.address,
-            DEFAULT_DATA_SOURCE.chain,
-            vec![PriceAttestation::default()],
-        );
-        assert_eq!(result, Err(PythContractError::InvalidUpdateEmitter.into()));
-    }
-
-    #[test]
-    fn test_verify_vaa_sender_fail_wrong_emitter_chain() {
-        let result = apply_price_update(
-            &default_config_info(),
-            DEFAULT_DATA_SOURCE.address,
-            WRONG_SOURCE.chain,
-            vec![PriceAttestation::default()],
-        );
-        assert_eq!(result, Err(PythContractError::InvalidUpdateEmitter.into()));
-    }
-
-    #[test]
-    fn test_update_price_feed_if_new_first_price_ok() {
-        let (mut deps, env) = setup_test();
-        let price_feed = create_price_feed(3, 100);
-
-        let changed = do_update_price_feed(&mut deps.as_mut(), &env, price_feed);
-        assert!(changed);
-
-        let stored_price_feed = price_feed_bucket(&mut deps.storage)
-            .load(price_feed.id.as_ref())
-            .unwrap();
-
-        assert_eq!(stored_price_feed, price_feed);
-    }
-
-    #[test]
-    fn test_update_price_feed_if_new_ignore_duplicate_time() {
-        let (mut deps, env) = setup_test();
-
-        let first_price_feed = create_price_feed(3, 100);
-        let changed = do_update_price_feed(&mut deps.as_mut(), &env, first_price_feed);
-        assert!(changed);
-
-        let second_price_feed = create_price_feed(4, 100);
-        let changed = do_update_price_feed(&mut deps.as_mut(), &env, second_price_feed);
-        assert!(!changed);
-
-        let stored_price_feed = price_feed_bucket(&mut deps.storage)
-            .load(first_price_feed.id.as_ref())
-            .unwrap();
-        assert_eq!(stored_price_feed, first_price_feed);
-    }
-
-    #[test]
-    fn test_update_price_feed_if_new_ignore_older() {
-        let (mut deps, env) = setup_test();
-
-        let first_price_feed = create_price_feed(3, 100);
-        let changed = do_update_price_feed(&mut deps.as_mut(), &env, first_price_feed);
-        assert!(changed);
-
-        let second_price_feed = create_price_feed(4, 90);
-        let changed = do_update_price_feed(&mut deps.as_mut(), &env, second_price_feed);
-        assert!(!changed);
-
-        let stored_price_feed = price_feed_bucket(&mut deps.storage)
-            .load(first_price_feed.id.as_ref())
-            .unwrap();
-        assert_eq!(stored_price_feed, first_price_feed);
-    }
-
-    #[test]
-    fn test_update_price_feed_if_new_accept_newer() {
-        let (mut deps, env) = setup_test();
-
-        let first_price_feed = create_price_feed(3, 100);
-        let changed = do_update_price_feed(&mut deps.as_mut(), &env, first_price_feed);
-        assert!(changed);
-
-        let second_price_feed = create_price_feed(4, 110);
-        let changed = do_update_price_feed(&mut deps.as_mut(), &env, second_price_feed);
-        assert!(changed);
-
-        let stored_price_feed = price_feed_bucket(&mut deps.storage)
-            .load(first_price_feed.id.as_ref())
-            .unwrap();
-        assert_eq!(stored_price_feed, second_price_feed);
-    }
-
-    #[test]
-    fn test_query_price_info_ok() {
-        let (mut deps, _env) = setup_test();
-
-        let address = b"123".as_ref();
-
-        let dummy_price_feed = PriceFeed::new(
-            PriceIdentifier::new([0u8; 32]),
-            Price {
-                price:        300,
-                conf:         301,
-                expo:         302,
-                publish_time: 303,
-            },
-            Default::default(),
-        );
-        price_feed_bucket(&mut deps.storage)
-            .save(address, &dummy_price_feed)
-            .unwrap();
-
-        let price_feed = query_price_feed(&deps.as_ref(), address)
-            .unwrap()
-            .price_feed;
-
-        assert_eq!(price_feed.get_price_unchecked().price, 300);
-        assert_eq!(price_feed.get_price_unchecked().conf, 301);
-        assert_eq!(price_feed.get_price_unchecked().expo, 302);
-        assert_eq!(price_feed.get_price_unchecked().publish_time, 303);
-    }
-
-    #[test]
-    fn test_query_price_info_err_not_found() {
-        let deps = setup_test().0;
-
-        assert_eq!(
-            query_price_feed(&deps.as_ref(), b"123".as_ref()),
-            Err(PythContractError::PriceFeedNotFound.into())
-        );
-    }
-
-    #[test]
-    fn test_get_update_fee() {
-        let (mut deps, _env) = setup_test();
-        let fee_denom: String = "test".into();
-        config(&mut deps.storage)
-            .save(&ConfigInfo {
-                fee: Coin::new(10, fee_denom.clone()),
-                ..create_zero_config_info()
+        let bytes: Result<Vec<u8>, _> = (0..hex.len())
+            .step_by(2)
+            .map(|i| {
+                u8::from_str_radix(&hex[i..i + 2], 16)
+                    .map_err(|e| format!("Invalid hex string: {}", e))
             })
-            .unwrap();
+            .collect();
 
-        let updates = vec![Binary::from([1u8]), Binary::from([2u8])];
-
-        assert_eq!(
-            get_update_fee(&deps.as_ref(), &updates[0..0]),
-            Ok(Coin::new(0, fee_denom.clone()))
-        );
-        assert_eq!(
-            get_update_fee(&deps.as_ref(), &updates[0..1]),
-            Ok(Coin::new(10, fee_denom.clone()))
-        );
-        assert_eq!(
-            get_update_fee(&deps.as_ref(), &updates[0..2]),
-            Ok(Coin::new(20, fee_denom.clone()))
-        );
-
-        let big_fee: u128 = (u128::MAX / 4) * 3;
-        config(&mut deps.storage)
-            .save(&ConfigInfo {
-                fee: Coin::new(big_fee, fee_denom.clone()),
-                ..create_zero_config_info()
-            })
-            .unwrap();
-
-        assert_eq!(
-            get_update_fee(&deps.as_ref(), &updates[0..1]),
-            Ok(Coin::new(big_fee, fee_denom))
-        );
-        assert!(get_update_fee(&deps.as_ref(), &updates[0..2]).is_err());
-    }
-
-    #[cfg(feature = "osmosis")]
-    #[test]
-    fn test_get_update_fee_for_denom() {
-        let (mut deps, _env) = setup_test();
-        let base_denom = "test";
-        config(&mut deps.storage)
-            .save(&ConfigInfo {
-                fee: Coin::new(10, base_denom),
-                ..create_zero_config_info()
-            })
-            .unwrap();
-
-        let updates = vec![Binary::from([1u8]), Binary::from([2u8])];
-
-        // test for base denom
-        assert_eq!(
-            get_update_fee_for_denom(&deps.as_ref(), &updates[0..0], base_denom.to_string()),
-            Ok(Coin::new(0, base_denom))
-        );
-        assert_eq!(
-            get_update_fee_for_denom(&deps.as_ref(), &updates[0..1], base_denom.to_string()),
-            Ok(Coin::new(10, base_denom))
-        );
-        assert_eq!(
-            get_update_fee_for_denom(&deps.as_ref(), &updates[0..2], base_denom.to_string()),
-            Ok(Coin::new(20, base_denom))
-        );
-
-        // test for valid but not base denom
-        // valid denoms are 'uion' or 'ibc/FF3065989E34457F342D4EFB8692406D49D4E2B5C70F725F127862E22CE6BDCD'
-        assert_eq!(
-            get_update_fee_for_denom(&deps.as_ref(), &updates[0..0], "uion".to_string()),
-            Ok(Coin::new(0, "uion"))
-        );
-        assert_eq!(
-            get_update_fee_for_denom(&deps.as_ref(), &updates[0..1], "uion".to_string()),
-            Ok(Coin::new(10, "uion"))
-        );
-        assert_eq!(
-            get_update_fee_for_denom(&deps.as_ref(), &updates[0..2], "uion".to_string()),
-            Ok(Coin::new(20, "uion"))
-        );
-
-
-        // test for invalid denom
-        assert_eq!(
-            get_update_fee_for_denom(&deps.as_ref(), &updates[0..0], "invalid_denom".to_string()),
-            Err(PythContractError::InvalidFeeDenom {
-                denom: "invalid_denom".to_string(),
-            }
-            .into())
-        );
-        assert_eq!(
-            get_update_fee_for_denom(&deps.as_ref(), &updates[0..1], "invalid_denom".to_string()),
-            Err(PythContractError::InvalidFeeDenom {
-                denom: "invalid_denom".to_string(),
-            }
-            .into())
-        );
-        assert_eq!(
-            get_update_fee_for_denom(&deps.as_ref(), &updates[0..2], "invalid_denom".to_string()),
-            Err(PythContractError::InvalidFeeDenom {
-                denom: "invalid_denom".to_string(),
-            }
-            .into())
-        );
-
-        // check for overflow
-        let big_fee: u128 = (u128::MAX / 4) * 3;
-        config(&mut deps.storage)
-            .save(&ConfigInfo {
-                fee: Coin::new(big_fee, base_denom),
-                ..create_zero_config_info()
-            })
-            .unwrap();
-
-        // base denom
-        assert_eq!(
-            get_update_fee_for_denom(&deps.as_ref(), &updates[0..1], base_denom.to_string()),
-            Ok(Coin::new(big_fee, base_denom))
-        );
-        assert!(
-            get_update_fee_for_denom(&deps.as_ref(), &updates[0..2], base_denom.to_string())
-                .is_err()
-        );
-
-        // valid but not base
-        assert_eq!(
-            get_update_fee_for_denom(&deps.as_ref(), &updates[0..1], "uion".to_string()),
-            Ok(Coin::new(big_fee, "uion"))
-        );
-        assert!(
-            get_update_fee_for_denom(&deps.as_ref(), &updates[0..2], "uion".to_string()).is_err()
-        );
-
-        // invalid
-        assert_eq!(
-            get_update_fee_for_denom(&deps.as_ref(), &updates[0..1], "invalid_denom".to_string()),
-            Err(PythContractError::InvalidFeeDenom {
-                denom: "invalid_denom".to_string(),
-            }
-            .into())
-        );
-        assert_eq!(
-            get_update_fee_for_denom(&deps.as_ref(), &updates[0..2], "invalid_denom".to_string()),
-            Err(PythContractError::InvalidFeeDenom {
-                denom: "invalid_denom".to_string(),
-            }
-            .into())
-        );
+        bytes.map(Binary::from)
     }
 
     #[test]
-    fn test_get_valid_time_period() {
-        let (mut deps, _env) = setup_test();
-        config(&mut deps.storage)
-            .save(&ConfigInfo {
-                valid_time_period: Duration::from_secs(10),
-                ..create_zero_config_info()
-            })
-            .unwrap();
-
-        assert_eq!(
-            get_valid_time_period(&deps.as_ref()),
-            Ok(Duration::from_secs(10))
-        );
-    }
-
-    /// Initialize the contract with `initial_config` then execute `vaa` as a governance instruction
-    /// against it. Returns the response of the governance instruction along with the resulting config.
-    fn apply_governance_vaa(
-        initial_config: &ConfigInfo,
-        vaa: &Vaa<Box<RawMessage>>,
-    ) -> StdResult<(Response<MsgWrapper>, ConfigInfo)> {
+    fn test_real_data() {
+        let data = "504e41550100000003b801000000040d00d165bdba28960bda513f3ec9efb9f766e7910121d36213350a9031300cbc654543c322e1f26640d90082f7bf94d1e33743765012012972809e4300a84a927bab00020f7f1e256ac3e3f275bc7b611954dcfef219437d0fffe901a31f17a97a1321840596d424ad8ff1fb759c8c3d680db7733d2eec64f9b9a1fcb9d0bad1f83f87e9000365683b3a7142548fe257e1b4eb07dd95dcbb3589243195a3ada36cbe47a16c9f701c84f7b144d5d21e372a3609dd2ff9f47e824ed28c315f483843aeedd6cd7900049466312ae14c8e2f5f4081ecb184668a44591f05e50a15387aaf7761da2362064ad47b0b1b978c4e7da886f406ec0a6a7e25625eabcffa68e586a80a59678a74010698faf88d5334b413f4d23e8ad49b831a1fa1394b4247e127de7b764c9ba9b0ea3ba5fb1f6751118e219ea93234cb52279fb237503cbe68bbaa65acd86ae4bc7b0008d06e4830b86d1263c9cc137a83eb28fcc00bbf6994612728774ecca0c48f11624a19a8cb75896ac38bcfd411d5f33185a86a11b39982ac0a1892938cb83eaab2000a90c573be13126f88aa705b517aee8ddc2d905cbfb6ef431a7b5a2314cf9686211b0f052adb62d97c79720af0ff53b76a2bd3e61515f07d11042f0f1cbfe84131000b7abc15acdb0076e1854613ec8b840f9eb88a158d68744cecab37ffa0c32db4206bee13bcfabe591ee14d43c4cacc1e4e46f03a3a9e98942b60f5c90792b99238010c793efcdf831ec7d90f6c8283bf68c2d2b6bce415fa269be0d680dfba567bad596809deee7d6444bc427f0e77afe3c85152c99955d9a3cca115d3ccdf28eaaee1000dfe240e9b6d0501f949449cf234a14076465759d0d1a8ae0a05c9858d5a4b23ee498c2a18b6c0e91d6e0403f60176cc877c1cb02e108796dd8a88753d1853cccd010ee5d7e96c3d01236812ed95e6920ffa70509d4d137589cd9b3acc03f6ce6b85165e78192e7f438e678c01eef55bcf702112f0c384a00518b8b08d8dd8dc571cf4000f353f2cd3a2dfcd291a1ae173defe80b7c8f8944017c1251de940152ae4f7eac30503319a6648b7cb0731a379928c7bdec08dc98030862208c8b2229fa0e7d47200120cd030f4676f90b18956a7518eca9dc629cdd2b9a34b0f7c6a61d9eb37928e3a1bccca5a91d9f6b9b63f2a627de21c4ab9cd2de54c0d91156fd3255fcb4b59f30066a9ecfc00000000001ae101faedac5851e32b9b23b5f9411a8c2bac4aae3ed4dd7b811dd1a72ea4aa7100000000043f0736014155575600000000000949a84f000027103c8e153228ef72ea4b27f6b1248c9aa7aa53bd5002005500e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b4300000608b9fe5288000000008af90199fffffff80000000066a9ecfc0000000066a9ecfc00000606bdc3dba000000000a5e8b6100b843d0c07a4128bc4937f14c5aae17e5a153c90909765fcf9f0c5f256726fbfc8281187a647cc6d118f5d64ed0198177b9bf8e3787b900283ac623c6436e401283fb51cc7dbcd6b8a92deee366302cfae686af134d4f94d0d1996761932576929e3e4c5df3a3cfb235effb53d7570d0d72e4838c2d3a7eb702d090274dbdb87e74f22d10304e9bae0c5301657860121ee590493f146f6b597d83a87e74bc0272506c848a6ac7069dc698a16014ebeed6a32049ae5c13e1389c148a68d790f5b33c8a2159f2c4458262d5ba5a11f38dafcc4e5819df7e2f6c8399ee5e6005500ff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace0000004d6adae3ec000000000903b527fffffff80000000066a9ecfc0000000066a9ecfc0000004d176f1e4000000000083ac0f00b989c250a83568734c8bb09089eca38e89acddd94ae6486449282202087b96062446ba7c0568a2941bfdd13e983e95975df5838100be862de23b8211b3d38ec8c5b6f6e10d5a9ae0efb34b0657e2250f1992dcd54791d4c97fd5357e9c13789d5b18105d612226371a6cc968f9502192a0d260462040d316d1c9eb0d202a4f7a08699c3074fa431f5e1a0543d6d56d1448b7042263848f8b4da16a23e5c89fabbbb4b9d65925a0a8fb732c16704effcecfa6345d5e7edfa5c40a8ce4976556054f18a7e47e072ea302d5ba5a11f38dafcc4e5819df7e2f6c8399ee5e6";
         let (mut deps, env) = setup_test();
-        config(&mut deps.storage).save(initial_config).unwrap();
-
-        let info = mock_info("123", &[]);
-
-        let result = execute_governance_instruction(
-            deps.as_mut(),
-            env,
-            info,
-            &serde_wormhole::to_vec(vaa).unwrap().into(),
-        );
-
-        result.and_then(|response| config_read(&deps.storage).load().map(|c| (response, c)))
-    }
-
-    fn governance_test_config() -> ConfigInfo {
-        ConfigInfo {
-            wormhole_contract: Addr::unchecked(WORMHOLE_ADDR),
-            governance_source: PythDataSource {
-                emitter:  Binary(DEFAULT_GOVERNANCE_SOURCE.address.0.to_vec()),
-                chain_id: DEFAULT_GOVERNANCE_SOURCE.chain.into(),
-            },
-            governance_sequence_number: 4,
-            chain_id: DEFAULT_CHAIN_ID.into(),
-            ..create_zero_config_info()
-        }
-    }
-
-    fn governance_vaa(instruction: &GovernanceInstruction) -> Vaa<Box<RawMessage>> {
-        create_vaa_from_payload(
-            &instruction.serialize().unwrap(),
-            DEFAULT_GOVERNANCE_SOURCE.address,
-            DEFAULT_GOVERNANCE_SOURCE.chain,
-            7,
-        )
-    }
-
-    #[test]
-    fn test_governance_authorization() {
-        let test_config = governance_test_config();
-
-        let test_instruction = GovernanceInstruction {
-            module:          Target,
-            target_chain_id: DEFAULT_CHAIN_ID.into(),
-            action:          SetFee { val: 6, expo: 0 },
-        };
-        let test_vaa = governance_vaa(&test_instruction);
-
-        // First check that a valid VAA is accepted (to ensure that no one accidentally breaks the following test cases).
-        assert!(apply_governance_vaa(&test_config, &test_vaa).is_ok());
-
-        // Wrong emitter address
-        let mut vaa_copy = test_vaa.clone();
-        vaa_copy.emitter_address = WRONG_SOURCE.address;
-        assert!(apply_governance_vaa(&test_config, &vaa_copy).is_err());
-
-        // wrong source chain
-        let mut vaa_copy = test_vaa.clone();
-        vaa_copy.emitter_chain = WRONG_SOURCE.chain;
-        assert!(apply_governance_vaa(&test_config, &vaa_copy).is_err());
-
-        // sequence number too low
-        let mut vaa_copy = test_vaa.clone();
-        vaa_copy.sequence = 4;
-        assert!(apply_governance_vaa(&test_config, &vaa_copy).is_err());
-
-        // wrong magic number
-        let mut vaa_copy = test_vaa.clone();
-        let mut new_payload = vaa_copy.payload.to_vec();
-        new_payload[0] = 0;
-        vaa_copy.payload = <Box<RawMessage>>::from(new_payload);
-        assert!(apply_governance_vaa(&test_config, &vaa_copy).is_err());
-
-        // wrong target chain
-        let mut instruction_copy = test_instruction.clone();
-        instruction_copy.target_chain_id = WRONG_CHAIN_ID.into();
-        let mut vaa_copy = test_vaa.clone();
-        vaa_copy.payload = <Box<RawMessage>>::from(instruction_copy.serialize().unwrap());
-        assert!(apply_governance_vaa(&test_config, &vaa_copy).is_err());
-
-        // target chain == 0 is allowed
-        let mut instruction_copy = test_instruction.clone();
-        instruction_copy.target_chain_id = 0;
-        let mut vaa_copy = test_vaa.clone();
-        vaa_copy.payload = <Box<RawMessage>>::from(instruction_copy.serialize().unwrap());
-        assert!(apply_governance_vaa(&test_config, &vaa_copy).is_ok());
-
-        // wrong module
-        let mut instruction_copy = test_instruction;
-        instruction_copy.module = Executor;
-        let mut vaa_copy = test_vaa;
-        vaa_copy.payload = <Box<RawMessage>>::from(instruction_copy.serialize().unwrap());
-        assert!(apply_governance_vaa(&test_config, &vaa_copy).is_err());
-
-        // invalid action index
-        let mut new_payload = vaa_copy.payload.to_vec();
-        new_payload[9] = 100;
-        vaa_copy.payload = <Box<RawMessage>>::from(new_payload);
-        assert!(apply_governance_vaa(&test_config, &vaa_copy).is_err());
-    }
-
-    #[test]
-    fn test_authorize_governance_transfer_success() {
-        let source_2 = PythDataSource {
-            emitter:  Binary::from(SECONDARY_GOVERNANCE_SOURCE.address.0),
-            chain_id: SECONDARY_GOVERNANCE_SOURCE.chain.into(),
-        };
-
-        let test_config = governance_test_config();
-
-        let claim_vaa = create_vaa_from_payload(
-            &GovernanceInstruction {
-                module:          Target,
-                target_chain_id: test_config.chain_id,
-                action:          RequestGovernanceDataSourceTransfer {
-                    governance_data_source_index: 1,
-                },
-            }
-            .serialize()
-            .unwrap(),
-            SECONDARY_GOVERNANCE_SOURCE.address,
-            SECONDARY_GOVERNANCE_SOURCE.chain,
-            12,
-        );
-
-        let test_instruction = GovernanceInstruction {
-            module:          Target,
-            target_chain_id: test_config.chain_id,
-            action:          AuthorizeGovernanceDataSourceTransfer {
-                claim_vaa: serde_wormhole::to_vec(&claim_vaa).unwrap().into(),
-            },
-        };
-
-        let test_vaa = governance_vaa(&test_instruction);
-        let (_response, result_config) = apply_governance_vaa(&test_config, &test_vaa).unwrap();
-        assert_eq!(result_config.governance_source, source_2);
-        assert_eq!(result_config.governance_source_index, 1);
-        assert_eq!(result_config.governance_sequence_number, 12);
-    }
-
-    #[test]
-    fn test_authorize_governance_transfer_bad_source_index() {
-        let mut test_config = governance_test_config();
-        test_config.governance_source_index = 10;
-
-        let claim_vaa = create_vaa_from_payload(
-            &GovernanceInstruction {
-                module:          Target,
-                target_chain_id: test_config.chain_id,
-                action:          RequestGovernanceDataSourceTransfer {
-                    governance_data_source_index: 10,
-                },
-            }
-            .serialize()
-            .unwrap(),
-            SECONDARY_GOVERNANCE_SOURCE.address,
-            SECONDARY_GOVERNANCE_SOURCE.chain,
-            12,
-        );
-
-        let test_instruction = GovernanceInstruction {
-            module:          Target,
-            target_chain_id: test_config.chain_id,
-            action:          AuthorizeGovernanceDataSourceTransfer {
-                claim_vaa: serde_wormhole::to_vec(&claim_vaa).unwrap().into(),
-            },
-        };
-
-        let test_vaa = governance_vaa(&test_instruction);
-        assert_eq!(
-            apply_governance_vaa(&test_config, &test_vaa),
-            Err(PythContractError::InvalidGovernanceSourceIndex.into())
-        );
-    }
-
-    #[test]
-    fn test_authorize_governance_transfer_bad_target_chain() {
-        let test_config = governance_test_config();
-
-        let claim_vaa = create_vaa_from_payload(
-            &GovernanceInstruction {
-                module:          Target,
-                target_chain_id: WRONG_CHAIN_ID.into(),
-                action:          RequestGovernanceDataSourceTransfer {
-                    governance_data_source_index: 11,
-                },
-            }
-            .serialize()
-            .unwrap(),
-            SECONDARY_GOVERNANCE_SOURCE.address,
-            SECONDARY_GOVERNANCE_SOURCE.chain,
-            12,
-        );
-
-        let test_instruction = GovernanceInstruction {
-            module:          Target,
-            target_chain_id: test_config.chain_id,
-            action:          AuthorizeGovernanceDataSourceTransfer {
-                claim_vaa: serde_wormhole::to_vec(&claim_vaa).unwrap().into(),
-            },
-        };
-
-        let test_vaa = governance_vaa(&test_instruction);
-        assert_eq!(
-            apply_governance_vaa(&test_config, &test_vaa),
-            Err(PythContractError::InvalidGovernancePayload.into())
-        );
-    }
-
-    #[test]
-    fn test_set_data_sources() {
-        let source_1 = PythDataSource {
-            emitter:  Binary::from([1u8; 32]),
-            chain_id: 2,
-        };
-        let source_2 = PythDataSource {
-            emitter:  Binary::from([2u8; 32]),
-            chain_id: 4,
-        };
-        let source_3 = PythDataSource {
-            emitter:  Binary::from([3u8; 32]),
-            chain_id: 6,
-        };
-
-        let mut test_config = governance_test_config();
-        test_config.data_sources = HashSet::from([source_1]);
-
-        let test_instruction = GovernanceInstruction {
-            module:          Target,
-            target_chain_id: test_config.chain_id,
-            action:          SetDataSources {
-                data_sources: vec![source_2.clone(), source_3.clone()],
-            },
-        };
-        let test_vaa = governance_vaa(&test_instruction);
-        assert_eq!(
-            apply_governance_vaa(&test_config, &test_vaa).map(|(_r, c)| c.data_sources),
-            Ok([source_2, source_3].iter().cloned().collect())
-        );
-
-        let test_instruction = GovernanceInstruction {
-            module:          Target,
-            target_chain_id: test_config.chain_id,
-            action:          SetDataSources {
-                data_sources: vec![],
-            },
-        };
-        let test_vaa = governance_vaa(&test_instruction);
-        assert_eq!(
-            apply_governance_vaa(&test_config, &test_vaa).map(|(_r, c)| c.data_sources),
-            Ok(HashSet::new())
-        );
-    }
-
-    #[test]
-    fn test_set_fee() {
-        let mut test_config = governance_test_config();
-        test_config.fee = Coin::new(1, "foo");
-
-        let test_instruction = GovernanceInstruction {
-            module:          Target,
-            target_chain_id: DEFAULT_CHAIN_ID.into(),
-            action:          SetFee { val: 6, expo: 1 },
-        };
-        let test_vaa = governance_vaa(&test_instruction);
-
-        assert_eq!(
-            apply_governance_vaa(&test_config, &test_vaa).map(|(_r, c)| c.fee.amount),
-            Ok(Uint128::new(60))
-        );
-
-        let test_instruction = GovernanceInstruction {
-            module:          Target,
-            target_chain_id: DEFAULT_CHAIN_ID.into(),
-            action:          SetFee { val: 6, expo: 0 },
-        };
-        let test_vaa = governance_vaa(&test_instruction);
-
-        assert_eq!(
-            apply_governance_vaa(&test_config, &test_vaa).map(|(_r, c)| c.fee.amount),
-            Ok(Uint128::new(6))
-        );
-    }
-
-    #[test]
-    fn test_set_valid_period() {
-        let mut test_config = governance_test_config();
-        test_config.valid_time_period = Duration::from_secs(10);
-
-        let test_instruction = GovernanceInstruction {
-            module:          Target,
-            target_chain_id: DEFAULT_CHAIN_ID.into(),
-            action:          SetValidPeriod { valid_seconds: 20 },
-        };
-        let test_vaa = governance_vaa(&test_instruction);
-
-        assert_eq!(
-            apply_governance_vaa(&test_config, &test_vaa).map(|(_r, c)| c.valid_time_period),
-            Ok(Duration::from_secs(20))
-        );
-    }
-
-    #[test]
-    fn test_request_governance_transfer() {
-        let test_config = governance_test_config();
-
-        let test_instruction = GovernanceInstruction {
-            module:          Target,
-            target_chain_id: test_config.chain_id,
-            action:          RequestGovernanceDataSourceTransfer {
-                governance_data_source_index: 7,
-            },
-        };
-        let test_vaa = governance_vaa(&test_instruction);
-
-        assert!(apply_governance_vaa(&test_config, &test_vaa).is_err());
+        config(&mut deps.storage).save(&arb_config_info()).unwrap();
+        // let msg = create_batch_price_update_msg(emitter_address, emitter_chain, attestations);
+        let res = apply_updates(&mut deps.as_mut(), &env, &[hex_to_binary(data).unwrap()]);
+        println!("{:?}", res);
+        assert_eq!(0, 0);
     }
 }

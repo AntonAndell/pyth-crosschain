@@ -1574,6 +1574,7 @@ dependencies = [
  "cosmwasm-vm",
  "generic-array",
  "hex",
+ "k256",
  "lazy_static",
  "osmosis-std",
  "pyth-sdk 0.7.0",
